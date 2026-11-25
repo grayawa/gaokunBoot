@@ -1,0 +1,6 @@
+/target/
+/dist/
+/fv_dump/
+*.img
+*.iso
+*.efi
