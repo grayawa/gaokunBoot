@@ -13,8 +13,8 @@ A custom, tablet-first graphical multi-OS UEFI boot manager written in Rust (`aa
   - **Top Bar**: Custom `gaokunBoot` vector logo + live SMBIOS device info (`HUAWEI GK-W7X`), BIOS version, `CurrentEL`, Touchscreen status, build version, and partial-rect auto-boot countdown badge.
   - **Left Sidebar**: Clean `Main Boot Menu` (OS cards only) + bottom-pinned `Settings` button.
   - **Right Pane**:
-    - **`OS specific info & Settings`**: Per-OS controls (Android **Slot A / Slot B** live switcher, Linux/EFI-stub **EL1 (QHEE) / EL2 (KVM)** switch with automatic `slbounce.efi` / `qebspil.efi` and `*-el2.dtb` detection), target paths & cmdline preview, and large touch-friendly `Boot` / `Set as Default` buttons.
-    - **`GaokunBoot Settings`**: Auto-Boot Timeout (`Off / 3s / 5s / 10s`), Default Boot Target (any OS or `Remember Last Booted`), 5-level sub-pixel Touchpad Pointer Speed (`0.35x`–`2.00x`), plus `UEFI BIOS Setup`, `Reboot`, and `Power Off`.
+    - **`OS specific info & Settings`**: Per-OS controls (**Boot Method** live toggle between Chainload & Direct EFI Stub, Android **Slot A / Slot B** switcher, Linux/EFI-stub **EL1 (QHEE) / EL2 (KVM)** switch with automatic `slbounce.efi` / `qebspil.efi` and `*-el2.dtb` detection), target paths & cmdline preview, and large touch-friendly `Boot` / `Set as Default` buttons.
+    - **`GaokunBoot Settings`**: Auto-Boot Timeout (`Off / 3s / 5s / 10s`), Default Boot Target (any OS or `Remember Last Booted`), Menu Entry Grouping (`Grouped` clean 1-card-per-OS view vs `Raw` all entries), 5-level sub-pixel Touchpad Pointer Speed (`0.35x`–`2.00x`), plus `UEFI BIOS Setup`, `Reboot`, and `Power Off`.
 - **Full 3-Mode Input**:
   - **Native Touchscreen**: Automatically wakes Huawei's `I2cTouchPanel.efi` via its `TouchDeviceInit` protocol (`8d59d323-c654-4ae7-7b15-f25904992a42`), with 5ms polling, fast-tap capture, and 180ms debounce.
   - **Tablet Hardware Buttons**: `Volume+` / `Volume-` + `Power` (`0x0102`) for 100% keyboard-less navigation and settings control.

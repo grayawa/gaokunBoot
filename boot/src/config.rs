@@ -42,6 +42,28 @@ impl AndroidSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootMethod {
+    Chainload,
+    DirectStub,
+}
+
+impl BootMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BootMethod::Chainload => "chainload",
+            BootMethod::DirectStub => "direct",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            BootMethod::Chainload => BootMethod::DirectStub,
+            BootMethod::DirectStub => BootMethod::Chainload,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BootConfig {
     /// Entry ID to highlight/auto-boot by default.
@@ -53,10 +75,16 @@ pub struct BootConfig {
     pub last_booted_id: String,
     /// Preferred Android A/B slot.
     pub android_slot: AndroidSlot,
+    /// Preferred Android boot method when both Chainload (gk3boot) and Direct Stub exist.
+    pub android_method: BootMethod,
+    /// Preferred Linux boot method when both Direct Stub and Chainload (GRUB/EFI) exist.
+    pub linux_method: BootMethod,
     /// Whether to boot Linux / EFI-stub entries in EL2 (via slbounce + optional qebspil).
     pub linux_el2: bool,
-    /// Pointer speed level: 1 (Slow) .. 5 (Turbo). Default 2 (0.6x).
+    /// Pointer speed level: 1 (Slow) .. 5 (Turbo). Default 2 (0.60x).
     pub ptr_speed: u8,
+    /// Whether to merge duplicate OS entries (Chainload + Direct Stub & A/B slots) into single cards.
+    pub group_entries: bool,
 }
 
 impl Default for BootConfig {
@@ -66,8 +94,11 @@ impl Default for BootConfig {
             timeout_secs: 5,
             last_booted_id: String::new(),
             android_slot: AndroidSlot::A,
+            android_method: BootMethod::Chainload,
+            linux_method: BootMethod::DirectStub,
             linux_el2: false,
             ptr_speed: 2,
+            group_entries: true,
         }
     }
 }
@@ -108,6 +139,20 @@ impl BootConfig {
                             AndroidSlot::A
                         };
                     }
+                    "android_method" => {
+                        self.android_method = if v.eq_ignore_ascii_case("direct") {
+                            BootMethod::DirectStub
+                        } else {
+                            BootMethod::Chainload
+                        };
+                    }
+                    "linux_method" => {
+                        self.linux_method = if v.eq_ignore_ascii_case("chainload") {
+                            BootMethod::Chainload
+                        } else {
+                            BootMethod::DirectStub
+                        };
+                    }
                     "linux_el2" => {
                         self.linux_el2 = v == "1" || v.eq_ignore_ascii_case("true");
                     }
@@ -115,6 +160,9 @@ impl BootConfig {
                         if let Ok(n) = v.parse::<u8>() {
                             self.ptr_speed = n.clamp(1, 5);
                         }
+                    }
+                    "group_entries" => {
+                        self.group_entries = !(v == "0" || v.eq_ignore_ascii_case("false"));
                     }
                     _ => {}
                 }
@@ -128,8 +176,11 @@ impl BootConfig {
         let _ = writeln!(s, "timeout={}", self.timeout_secs);
         let _ = writeln!(s, "last={}", self.last_booted_id);
         let _ = writeln!(s, "android_slot={}", self.android_slot.as_str());
+        let _ = writeln!(s, "android_method={}", self.android_method.as_str());
+        let _ = writeln!(s, "linux_method={}", self.linux_method.as_str());
         let _ = writeln!(s, "linux_el2={}", if self.linux_el2 { 1 } else { 0 });
         let _ = writeln!(s, "ptr_speed={}", self.ptr_speed);
+        let _ = writeln!(s, "group_entries={}", if self.group_entries { 1 } else { 0 });
         s
     }
 

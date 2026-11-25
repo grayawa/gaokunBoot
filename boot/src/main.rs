@@ -20,7 +20,7 @@ use uefi::prelude::*;
 use uefi::system;
 
 use config::BootConfig;
-use discover::{discover_entries, BootEntry, El2Drivers};
+use discover::{discover_entries, BootEntry, El2Drivers, OsKind};
 use gfx::Canvas;
 use input::{InputEvent, InputManager};
 use ui::{ClickAction, FocusPane, SettingFocus, SidebarSel, UiState};
@@ -75,11 +75,11 @@ fn try_boot_entry(
         let _ = cfg.save();
     }
 
-    let mut detail = format!("{}  |  {}", entry.mode_label(cfg.android_slot), entry.volume_label);
-    if entry.supports_ab_slot {
+    let mut detail = format!("{}  |  {}", entry.mode_label(cfg), entry.volume_label);
+    if entry.active_supports_ab(cfg) {
         detail = format!("{}  |  {}", detail, cfg.android_slot.label());
     }
-    if entry.supports_el2 && cfg.linux_el2 {
+    if entry.active_supports_el2(cfg) && cfg.linux_el2 {
         detail = format!("{}  |  EL2 (slbounce)", detail);
     }
 
@@ -121,7 +121,8 @@ fn main() -> Status {
     };
 
     let disc = discover_entries();
-    let entries = disc.entries;
+    let grouped_entries = disc.grouped_entries;
+    let raw_entries = disc.raw_entries;
     let el2_drivers = disc.el2_drivers;
 
     let mut cfg = BootConfig::load();
@@ -131,12 +132,20 @@ fn main() -> Status {
         }
     }
 
-    let initial_idx = resolve_initial_entry(&entries, &cfg);
+    let active_entries = |grouped: bool| -> &[BootEntry] {
+        if grouped {
+            &grouped_entries
+        } else {
+            &raw_entries
+        }
+    };
+
+    let initial_idx = resolve_initial_entry(active_entries(cfg.group_entries), &cfg);
     let current_el = efi_extra::read_current_el();
     let (device_name, bios_ver) = efi_extra::read_device_summary();
     let mut input = InputManager::init(canvas.w, canvas.h);
     let mut ui = UiState::new(
-        entries.len(),
+        active_entries(cfg.group_entries).len(),
         initial_idx,
         device_name,
         bios_ver,
@@ -145,14 +154,14 @@ fn main() -> Status {
         cfg.timeout_secs,
     );
 
-    if entries.is_empty() {
+    if active_entries(cfg.group_entries).is_empty() {
         ui.toast = Some((
             String::from("No Windows or BLS entries found on attached ESPs"),
             true,
         ));
     }
 
-    ui.render(&mut canvas, &entries, &cfg, &el2_drivers);
+    ui.render(&mut canvas, active_entries(cfg.group_entries), &cfg, &el2_drivers);
     canvas.present_full();
 
     // 5ms main loop tick: keeps Huawei 40ms/25Hz I2cTouchPanel responsive without dropping fast taps!
@@ -167,6 +176,7 @@ fn main() -> Status {
         let mut cursor_moved = false;
 
         for ev in events {
+            let entries = active_entries(cfg.group_entries);
             match ev {
                 InputEvent::PointerMove => {
                     cursor_moved = true;
@@ -192,7 +202,8 @@ fn main() -> Status {
                     if ui.focus == FocusPane::SettingsPane {
                         ui.focus = FocusPane::Sidebar;
                         if !entries.is_empty() {
-                            ui.sidebar_sel = SidebarSel::Entry(ui.last_entry_idx.min(entries.len() - 1));
+                            ui.sidebar_sel =
+                                SidebarSel::Entry(ui.last_entry_idx.min(entries.len() - 1));
                         }
                         needs_redraw = true;
                     }
@@ -207,7 +218,8 @@ fn main() -> Status {
                     if ui.focus == FocusPane::SettingsPane {
                         ui.focus = FocusPane::Sidebar;
                         if !entries.is_empty() {
-                            ui.sidebar_sel = SidebarSel::Entry(ui.last_entry_idx.min(entries.len() - 1));
+                            ui.sidebar_sel =
+                                SidebarSel::Entry(ui.last_entry_idx.min(entries.len() - 1));
                         }
                     } else {
                         ui.cancel_countdown();
@@ -220,6 +232,24 @@ fn main() -> Status {
                     let lbl = format!("timeout = {}", cfg.timeout_label());
                     save_cfg_with_toast(&cfg, &lbl, &mut ui);
                     needs_redraw = true;
+                }
+                InputEvent::ToggleBootMethod => {
+                    if let SidebarSel::Entry(idx) = ui.sidebar_sel {
+                        if idx < entries.len() && entries[idx].has_both_methods() {
+                            let kind = entries[idx].kind;
+                            if kind == OsKind::Android {
+                                cfg.android_method = cfg.android_method.toggle();
+                            } else {
+                                cfg.linux_method = cfg.linux_method.toggle();
+                            }
+                            let lbl = format!(
+                                "boot method = {}",
+                                entries[idx].active_variant(&cfg).label
+                            );
+                            save_cfg_with_toast(&cfg, &lbl, &mut ui);
+                            needs_redraw = true;
+                        }
+                    }
                 }
                 InputEvent::ToggleAndroidSlot => {
                     cfg.android_slot = cfg.android_slot.toggle();
@@ -280,7 +310,13 @@ fn main() -> Status {
                 InputEvent::Confirm => match ui.focus {
                     FocusPane::Sidebar => match ui.sidebar_sel {
                         SidebarSel::Entry(idx) if idx < entries.len() => {
-                            try_boot_entry(&entries[idx], &mut cfg, &el2_drivers, &mut ui, &mut canvas);
+                            try_boot_entry(
+                                &entries[idx],
+                                &mut cfg,
+                                &el2_drivers,
+                                &mut ui,
+                                &mut canvas,
+                            );
                             needs_redraw = true;
                         }
                         SidebarSel::Settings => {
@@ -298,8 +334,20 @@ fn main() -> Status {
                             needs_redraw = true;
                         }
                         SettingFocus::DefaultEntry => {
-                            cycle_default_entry(&entries, &mut cfg);
+                            cycle_default_entry(entries, &mut cfg);
                             save_cfg_with_toast(&cfg, "default boot entry", &mut ui);
+                            needs_redraw = true;
+                        }
+                        SettingFocus::EntryGrouping => {
+                            cfg.group_entries = !cfg.group_entries;
+                            ui.entry_count = active_entries(cfg.group_entries).len();
+                            ui.scroll_top = 0;
+                            let lbl = if cfg.group_entries {
+                                "menu = Grouped (Clean)"
+                            } else {
+                                "menu = Raw (All Entries)"
+                            };
+                            save_cfg_with_toast(&cfg, lbl, &mut ui);
                             needs_redraw = true;
                         }
                         SettingFocus::PtrSpeed => {
@@ -329,9 +377,10 @@ fn main() -> Status {
                         }
                         SettingFocus::BackToMenu => {
                             ui.focus = FocusPane::Sidebar;
-                            if !entries.is_empty() {
+                            let cur_entries = active_entries(cfg.group_entries);
+                            if !cur_entries.is_empty() {
                                 ui.sidebar_sel =
-                                    SidebarSel::Entry(ui.last_entry_idx.min(entries.len() - 1));
+                                    SidebarSel::Entry(ui.last_entry_idx.min(cur_entries.len() - 1));
                             }
                             needs_redraw = true;
                         }
@@ -346,9 +395,9 @@ fn main() -> Status {
                                 ui.focus = FocusPane::Sidebar;
                                 ui.sidebar_sel = SidebarSel::Entry(idx);
                                 ui.last_entry_idx = idx;
-                                // Touchpad double-click or intentional second tap (>400ms after selecting) boots!
                                 if already_sel
-                                    && (!from_touch || now_ms.saturating_sub(last_card_select_ms) >= 400)
+                                    && (!from_touch
+                                        || now_ms.saturating_sub(last_card_select_ms) >= 400)
                                     && idx < entries.len()
                                 {
                                     try_boot_entry(
@@ -370,9 +419,11 @@ fn main() -> Status {
                             }
                             ClickAction::BackToMenu => {
                                 ui.focus = FocusPane::Sidebar;
-                                if !entries.is_empty() {
-                                    ui.sidebar_sel =
-                                        SidebarSel::Entry(ui.last_entry_idx.min(entries.len() - 1));
+                                let cur_entries = active_entries(cfg.group_entries);
+                                if !cur_entries.is_empty() {
+                                    ui.sidebar_sel = SidebarSel::Entry(
+                                        ui.last_entry_idx.min(cur_entries.len() - 1),
+                                    );
                                 }
                                 needs_redraw = true;
                             }
@@ -395,6 +446,23 @@ fn main() -> Status {
                                     if idx < entries.len() {
                                         cfg.default_id = entries[idx].id.clone();
                                         let lbl = format!("default = {}", entries[idx].title);
+                                        save_cfg_with_toast(&cfg, &lbl, &mut ui);
+                                        needs_redraw = true;
+                                    }
+                                }
+                            }
+                            ClickAction::SetBootMethod(method) => {
+                                if let SidebarSel::Entry(idx) = ui.sidebar_sel {
+                                    if idx < entries.len() {
+                                        if entries[idx].kind == OsKind::Android {
+                                            cfg.android_method = method;
+                                        } else {
+                                            cfg.linux_method = method;
+                                        }
+                                        let lbl = format!(
+                                            "boot method = {}",
+                                            entries[idx].active_variant(&cfg).label
+                                        );
                                         save_cfg_with_toast(&cfg, &lbl, &mut ui);
                                         needs_redraw = true;
                                     }
@@ -423,8 +491,20 @@ fn main() -> Status {
                                 needs_redraw = true;
                             }
                             ClickAction::CycleDefault => {
-                                cycle_default_entry(&entries, &mut cfg);
+                                cycle_default_entry(entries, &mut cfg);
                                 save_cfg_with_toast(&cfg, "default boot entry", &mut ui);
+                                needs_redraw = true;
+                            }
+                            ClickAction::SetGrouping(grouped) => {
+                                cfg.group_entries = grouped;
+                                ui.entry_count = active_entries(cfg.group_entries).len();
+                                ui.scroll_top = 0;
+                                let lbl = if cfg.group_entries {
+                                    "menu = Grouped (Clean)"
+                                } else {
+                                    "menu = Raw (All Entries)"
+                                };
+                                save_cfg_with_toast(&cfg, lbl, &mut ui);
                                 needs_redraw = true;
                             }
                             ClickAction::SetPtrSpeed(level) => {
@@ -445,7 +525,11 @@ fn main() -> Status {
                                 }
                             }
                             ClickAction::Reboot => {
-                                ui.render_launching(&mut canvas, "Reboot", "Performing UEFI cold reset...");
+                                ui.render_launching(
+                                    &mut canvas,
+                                    "Reboot",
+                                    "Performing UEFI cold reset...",
+                                );
                                 launcher::reboot();
                             }
                             ClickAction::Shutdown => {
@@ -463,6 +547,7 @@ fn main() -> Status {
             let prev_sec = rem.div_ceil(1000);
             if rem <= tick_ms {
                 ui.countdown_ms = None;
+                let entries = active_entries(cfg.group_entries);
                 if let SidebarSel::Entry(idx) = ui.sidebar_sel {
                     if idx < entries.len() {
                         try_boot_entry(&entries[idx], &mut cfg, &el2_drivers, &mut ui, &mut canvas);
@@ -481,7 +566,12 @@ fn main() -> Status {
         }
 
         if needs_redraw {
-            ui.render(&mut canvas, &entries, &cfg, &el2_drivers);
+            ui.render(
+                &mut canvas,
+                active_entries(cfg.group_entries),
+                &cfg,
+                &el2_drivers,
+            );
             canvas.present_full();
             if input.cursor_visible {
                 canvas.update_cursor(Some((input.cursor_x, input.cursor_y)));

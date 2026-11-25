@@ -2,7 +2,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::config::{AndroidSlot, BootConfig, TIMEOUT_CHOICES};
+use crate::config::{AndroidSlot, BootConfig, BootMethod, TIMEOUT_CHOICES};
 use crate::discover::{BootEntry, BootPayload, El2Drivers, OsKind};
 use crate::gfx::{Canvas, Color, FontKind, Rect};
 
@@ -45,6 +45,7 @@ pub enum FocusPane {
 pub enum SettingFocus {
     Timeout,
     DefaultEntry,
+    EntryGrouping,
     PtrSpeed,
     BiosSetup,
     Reboot,
@@ -52,9 +53,10 @@ pub enum SettingFocus {
     BackToMenu,
 }
 
-const SETTINGS_ORDER: [SettingFocus; 7] = [
+const SETTINGS_ORDER: [SettingFocus; 8] = [
     SettingFocus::Timeout,
     SettingFocus::DefaultEntry,
+    SettingFocus::EntryGrouping,
     SettingFocus::PtrSpeed,
     SettingFocus::BiosSetup,
     SettingFocus::Reboot,
@@ -68,10 +70,12 @@ pub enum ClickAction {
     OpenSettings,
     BootSelected,
     SetSelectedDefault,
+    SetBootMethod(BootMethod),
     SetAndroidSlot(AndroidSlot),
     SetLinuxEl2(bool),
     SetTimeout(u8),
     CycleDefault,
+    SetGrouping(bool),
     SetPtrSpeed(u8),
     BiosSetup,
     Reboot,
@@ -491,11 +495,15 @@ impl UiState {
                 TEXT_PRIMARY,
             );
 
-            let mut sub = entry.subtitle.clone();
-            if entry.supports_ab_slot {
-                sub = format!("{} | {}", cfg.android_slot.label(), entry.volume_label);
+            let mut sub = if entry.has_both_methods() {
+                format!("{} | {}", entry.active_variant(cfg).label, entry.volume_label)
+            } else {
+                entry.subtitle.clone()
+            };
+            if entry.active_supports_ab(cfg) {
+                sub = format!("{} | {}", cfg.android_slot.label(), sub);
             }
-            if entry.supports_el2 {
+            if entry.active_supports_el2(cfg) {
                 let el_tag = if cfg.linux_el2 { "EL2" } else { "EL1" };
                 sub = format!("{} | {}", sub, el_tag);
             }
@@ -615,7 +623,12 @@ impl UiState {
     ) {
         let accent = Self::os_accent(entry.kind);
         let is_def = Self::is_entry_default(entry, e_idx, cfg);
-        let active_payload = entry.active_payload(cfg.android_slot);
+        let active_method = entry.active_method(cfg);
+        let active_variant = entry.active_variant(cfg);
+        let active_payload = entry.active_payload(cfg);
+        let has_both = entry.has_both_methods();
+        let supports_ab = entry.active_supports_ab(cfg);
+        let supports_el2 = entry.active_supports_el2(cfg);
 
         // Hero Row
         canvas.draw_os_icon(px, py, 112, entry.kind);
@@ -636,10 +649,10 @@ impl UiState {
             canvas,
             bx + 12,
             badge_y,
-            entry.mode_label(cfg.android_slot),
+            entry.mode_label(cfg),
             TEXT_SECONDARY,
         );
-        if entry.supports_ab_slot {
+        if supports_ab {
             bx = Self::draw_pill(canvas, bx + 12, badge_y, cfg.android_slot.label(), ACCENT_GREEN);
         }
         if is_def {
@@ -654,7 +667,56 @@ impl UiState {
         canvas.draw_text(FontKind::Mono, px, cy, "OS SPECIFIC SETTINGS", TEXT_MUTED);
         cy += 38;
 
-        if entry.supports_ab_slot {
+        if has_both {
+            let row_h = 84usize;
+            canvas.fill_rounded_rect(px, cy, pw, row_h, 18, BG_PANEL);
+            canvas.stroke_rounded_rect(px, cy, pw, row_h, 18, 1, BORDER_SUBTLE);
+            canvas.draw_text(FontKind::Ui, px + 28, cy + 19, "Boot Method  [M]", TEXT_PRIMARY);
+
+            let seg_w = 270usize;
+            let seg_h = 58usize;
+            let seg_y = cy + 13;
+            let r_right = Rect::new(px + pw - 20 - seg_w, seg_y, seg_w, seg_h);
+            let r_left = Rect::new(r_right.x - 16 - seg_w, seg_y, seg_w, seg_h);
+
+            let (left_m, left_lbl, right_m, right_lbl) = if entry.kind == OsKind::Android {
+                (
+                    BootMethod::Chainload,
+                    entry.chainload_label(),
+                    BootMethod::DirectStub,
+                    entry.direct_label(),
+                )
+            } else {
+                (
+                    BootMethod::DirectStub,
+                    entry.direct_label(),
+                    BootMethod::Chainload,
+                    entry.chainload_label(),
+                )
+            };
+
+            Self::draw_seg_ui(
+                canvas,
+                r_left,
+                left_lbl,
+                active_method == left_m,
+                accent,
+            );
+            Self::draw_seg_ui(
+                canvas,
+                r_right,
+                right_lbl,
+                active_method == right_m,
+                accent,
+            );
+            self.hit_boxes
+                .push((r_left, ClickAction::SetBootMethod(left_m)));
+            self.hit_boxes
+                .push((r_right, ClickAction::SetBootMethod(right_m)));
+            cy += row_h + 16;
+        }
+
+        if supports_ab {
             let row_h = 84usize;
             canvas.fill_rounded_rect(px, cy, pw, row_h, 18, BG_PANEL);
             canvas.stroke_rounded_rect(px, cy, pw, row_h, 18, 1, BORDER_SUBTLE);
@@ -686,7 +748,7 @@ impl UiState {
             cy += row_h + 16;
         }
 
-        if entry.supports_el2 {
+        if supports_el2 {
             let row_h = 84usize;
             canvas.fill_rounded_rect(px, cy, pw, row_h, 18, BG_PANEL);
             canvas.stroke_rounded_rect(px, cy, pw, row_h, 18, 1, BORDER_SUBTLE);
@@ -720,7 +782,7 @@ impl UiState {
             cy += row_h + 16;
         }
 
-        if !entry.supports_ab_slot && !entry.supports_el2 {
+        if !has_both && !supports_ab && !supports_el2 {
             let row_h = 74usize;
             canvas.fill_rounded_rect(px, cy, pw, row_h, 16, BG_PANEL);
             canvas.stroke_rounded_rect(px, cy, pw, row_h, 16, 1, BORDER_SUBTLE);
@@ -758,10 +820,10 @@ impl UiState {
                 iy,
                 iw,
                 "Source",
-                &format!("{}  ({})", entry.volume_label, entry.id),
+                &format!("{}  ({})", entry.volume_label, active_variant.source_id),
             );
-            if !entry.version.is_empty() {
-                iy = Self::draw_kv(canvas, ix, iy, iw, "Version", &entry.version);
+            if !active_variant.version.is_empty() {
+                iy = Self::draw_kv(canvas, ix, iy, iw, "Version", &active_variant.version);
             }
 
             let options_str: &str;
@@ -898,29 +960,30 @@ impl UiState {
             TEXT_SECONDARY,
         );
 
-        let mut cy = py + 124;
+        let mut cy = py + 116;
         canvas.fill_rect(px, cy, pw, 2, BORDER_SUBTLE);
-        cy += 30;
+        cy += 24;
 
         // Row 1: Auto-Boot Timeout
-        let row_h = 116usize;
+        let row_h = 104usize;
+        let row_gap = 18usize;
         let r1_focus = in_pane && active_setting == SettingFocus::Timeout;
         Self::draw_setting_frame(canvas, Rect::new(px, cy, pw, row_h), r1_focus, ACCENT_CYAN);
-        canvas.draw_text(FontKind::Ui, px + 32, cy + 18, "Auto-Boot Timeout  [T]", TEXT_PRIMARY);
+        canvas.draw_text(FontKind::Ui, px + 32, cy + 14, "Auto-Boot Timeout  [T]", TEXT_PRIMARY);
         canvas.draw_text(
             FontKind::Mono,
             px + 32,
-            cy + 68,
+            cy + 64,
             &format!("Current: {}", cfg.timeout_label()),
             TEXT_SECONDARY,
         );
-        let seg_w = 152usize;
-        let seg_h = 62usize;
+        let seg_w = 148usize;
+        let seg_h = 58usize;
         let seg_gap = 14usize;
         let total_seg_w = TIMEOUT_CHOICES.len() * seg_w + (TIMEOUT_CHOICES.len() - 1) * seg_gap;
         let seg_x0 = px + pw - 28 - total_seg_w;
         for (i, &secs) in TIMEOUT_CHOICES.iter().enumerate() {
-            let r = Rect::new(seg_x0 + i * (seg_w + seg_gap), cy + 27, seg_w, seg_h);
+            let r = Rect::new(seg_x0 + i * (seg_w + seg_gap), cy + 23, seg_w, seg_h);
             let lbl = if secs == 0 {
                 String::from("Off")
             } else {
@@ -929,34 +992,60 @@ impl UiState {
             Self::draw_seg_ui(canvas, r, &lbl, cfg.timeout_secs == secs, ACCENT_CYAN);
             self.hit_boxes.push((r, ClickAction::SetTimeout(secs)));
         }
-        cy += row_h + 22;
+        cy += row_h + row_gap;
 
         // Row 2: Default Boot Entry
         let r2_focus = in_pane && active_setting == SettingFocus::DefaultEntry;
         Self::draw_setting_frame(canvas, Rect::new(px, cy, pw, row_h), r2_focus, ACCENT_GREEN);
-        canvas.draw_text(FontKind::Ui, px + 32, cy + 18, "Default Boot Entry", TEXT_PRIMARY);
+        canvas.draw_text(FontKind::Ui, px + 32, cy + 14, "Default Boot Entry", TEXT_PRIMARY);
         let def_lbl = self.default_label(entries, cfg);
         canvas.draw_text_ellipsis(
             FontKind::Mono,
             px + 32,
-            cy + 68,
+            cy + 64,
             pw.saturating_sub(360),
             &format!("Current: {}", def_lbl),
             ACCENT_GREEN,
         );
-        let cyc_rect = Rect::new(px + pw - 28 - 280, cy + 27, 280, 62);
+        let cyc_rect = Rect::new(px + pw - 28 - 280, cy + 23, 280, 58);
         Self::draw_seg_ui(canvas, cyc_rect, "Cycle Default", true, ACCENT_GREEN);
         self.hit_boxes.push((cyc_rect, ClickAction::CycleDefault));
-        cy += row_h + 22;
+        cy += row_h + row_gap;
 
-        // Row 3: Touchpad / Mouse Pointer Speed (1..5)
+        // Row 3: Entry Grouping (Clean Merged OS cards vs Raw All Entries)
+        let r_grp_focus = in_pane && active_setting == SettingFocus::EntryGrouping;
+        Self::draw_setting_frame(canvas, Rect::new(px, cy, pw, row_h), r_grp_focus, ACCENT_PURPLE);
+        canvas.draw_text(FontKind::Ui, px + 32, cy + 14, "Menu Entry Grouping", TEXT_PRIMARY);
+        let grp_desc = if cfg.group_entries {
+            "Clean: merges Chainload + Direct Stub & A/B slots into 1 card per OS"
+        } else {
+            "Raw: lists every individual BLS .conf & EFI target separately"
+        };
+        canvas.draw_text_ellipsis(
+            FontKind::Mono,
+            px + 32,
+            cy + 64,
+            pw.saturating_sub(560),
+            grp_desc,
+            TEXT_SECONDARY,
+        );
+        let g_w = 228usize;
+        let g_raw = Rect::new(px + pw - 28 - g_w, cy + 23, g_w, 58);
+        let g_clean = Rect::new(g_raw.x - 14 - g_w, cy + 23, g_w, 58);
+        Self::draw_seg_ui(canvas, g_clean, "Grouped", cfg.group_entries, ACCENT_PURPLE);
+        Self::draw_seg_ui(canvas, g_raw, "Raw (All)", !cfg.group_entries, ACCENT_AMBER);
+        self.hit_boxes.push((g_clean, ClickAction::SetGrouping(true)));
+        self.hit_boxes.push((g_raw, ClickAction::SetGrouping(false)));
+        cy += row_h + row_gap;
+
+        // Row 4: Touchpad / Mouse Pointer Speed (1..5)
         let r3_focus = in_pane && active_setting == SettingFocus::PtrSpeed;
         Self::draw_setting_frame(canvas, Rect::new(px, cy, pw, row_h), r3_focus, ACCENT_CYAN);
-        canvas.draw_text(FontKind::Ui, px + 32, cy + 18, "Touchpad Pointer Speed  [V]", TEXT_PRIMARY);
+        canvas.draw_text(FontKind::Ui, px + 32, cy + 14, "Touchpad Pointer Speed  [V]", TEXT_PRIMARY);
         canvas.draw_text(
             FontKind::Mono,
             px + 32,
-            cy + 68,
+            cy + 64,
             cfg.ptr_speed_label(),
             TEXT_SECONDARY,
         );
@@ -967,23 +1056,23 @@ impl UiState {
         for level in 1..=5u8 {
             let r = Rect::new(
                 sp_x0 + ((level - 1) as usize) * (sp_w + sp_gap),
-                cy + 27,
+                cy + 23,
                 sp_w,
-                62,
+                58,
             );
             let lbl = format!("{}", level);
             Self::draw_seg_ui(canvas, r, &lbl, cfg.ptr_speed == level, ACCENT_CYAN);
             self.hit_boxes.push((r, ClickAction::SetPtrSpeed(level)));
         }
-        cy += row_h + 36;
+        cy += row_h + 28;
 
         // Section: Firmware & Power Actions (3 big touch cards side by side!)
         canvas.draw_text(FontKind::Mono, px, cy, "FIRMWARE & POWER", TEXT_MUTED);
-        cy += 38;
+        cy += 34;
 
         let act_gap = 22usize;
         let act_w = (pw - act_gap * 2) / 3;
-        let act_h = 136usize;
+        let act_h = 124usize;
 
         let actions = [
             (

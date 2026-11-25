@@ -21,6 +21,7 @@ pub enum InputEvent {
     Cancel,
     SetDefault,
     CycleTimeout,
+    ToggleBootMethod,
     ToggleAndroidSlot,
     ToggleLinuxEl2,
     CyclePtrSpeed,
@@ -193,6 +194,7 @@ impl InputManager {
             0x001B => Some(InputEvent::Cancel),
             0x006B | 0x004B | 0x0077 | 0x0057 => Some(InputEvent::MoveUp), // k / w
             0x006A | 0x004A => Some(InputEvent::MoveDown),                 // j
+            0x006D | 0x004D => Some(InputEvent::ToggleBootMethod),         // m / M
             0x0073 | 0x0053 => Some(InputEvent::ToggleAndroidSlot),        // s / S
             0x0065 | 0x0045 => Some(InputEvent::ToggleLinuxEl2),           // e / E
             0x0076 | 0x0056 => Some(InputEvent::CyclePtrSpeed),            // v / V

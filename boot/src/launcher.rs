@@ -355,16 +355,18 @@ pub fn launch_entry(
     cfg: &BootConfig,
     el2_drivers: &El2Drivers,
 ) -> Result<(), String> {
+    let variant = entry.active_variant(cfg);
+
     // 1. Optional per-entry UEFI drivers
-    for drv_path in &entry.drivers {
+    for drv_path in &variant.drivers {
         load_and_start_efi(entry.fs_handle, drv_path, "")?;
     }
 
-    // 2. Resolve active payload (respecting Android Slot A/B selection)
-    let payload = entry.active_payload(cfg.android_slot);
+    // 2. Resolve active payload (respecting Boot Method + Android Slot A/B selection)
+    let payload = entry.active_payload(cfg);
 
     // 3. Optional EL2 boot drivers (qebspil + slbounce) for Linux / EFI-stub kernels
-    let use_el2 = entry.supports_el2 && cfg.linux_el2;
+    let use_el2 = entry.active_supports_el2(cfg) && cfg.linux_el2;
     if use_el2 {
         let Some(drv_fs) = el2_drivers.fs_handle else {
             return Err(String::from(

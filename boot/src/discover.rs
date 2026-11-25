@@ -8,7 +8,7 @@ use uefi::proto::media::file::{File, FileAttribute, FileMode, FileType};
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::{cstr16, CStr16, Handle, Identify};
 
-use crate::config::AndroidSlot;
+use crate::config::{AndroidSlot, BootConfig, BootMethod};
 use crate::efi_extra::format_device_path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +47,32 @@ pub enum BootPayload {
     },
 }
 
+/// A single boot method variant (either Chainload or Direct EFI Stub), optionally supporting Slot A/B.
+#[derive(Clone, Debug)]
+pub struct MethodVariant {
+    pub label: String,
+    pub version: String,
+    pub source_id: String,
+    pub slot_a: BootPayload,
+    pub slot_b: Option<BootPayload>,
+    pub drivers: Vec<String>,
+}
+
+impl MethodVariant {
+    pub fn has_ab(&self) -> bool {
+        self.slot_b.is_some()
+    }
+
+    pub fn payload_for_slot(&self, slot: AndroidSlot) -> &BootPayload {
+        if slot == AndroidSlot::B {
+            if let Some(ref b) = self.slot_b {
+                return b;
+            }
+        }
+        &self.slot_a
+    }
+}
+
 /// Discovered EL2 UEFI helper drivers (slbounce + optional qebspil) on the ESP.
 #[derive(Clone, Debug, Default)]
 pub struct El2Drivers {
@@ -66,36 +92,79 @@ pub struct BootEntry {
     pub id: String,
     pub title: String,
     pub subtitle: String,
-    pub version: String,
     pub sort_key: String,
     pub kind: OsKind,
     pub volume_label: String,
     pub fs_handle: Handle,
-    pub drivers: Vec<String>,
-    pub payload: BootPayload,
-    /// Optional Slot B paired payload for Android A/B entries (toggled cleanly in UI!).
-    pub slot_b_payload: Option<BootPayload>,
-    /// True if this entry supports switching between Slot A and Slot B.
-    pub supports_ab_slot: bool,
-    /// True if this entry supports EL1 / EL2 switching (Linux / direct EFI-stub kernels).
-    pub supports_el2: bool,
+    /// Optional Chainload boot variant (e.g., Windows bootmgfw, Android gk3boot.efi, Linux GRUB).
+    pub chainload: Option<MethodVariant>,
+    /// Optional Direct ARM64 EFI Stub variant (e.g., crDroid Image + DTB + initrd, Linux vmlinuz).
+    pub direct: Option<MethodVariant>,
 }
 
 impl BootEntry {
-    pub fn active_payload(&self, slot: AndroidSlot) -> &BootPayload {
-        if self.supports_ab_slot && slot == AndroidSlot::B {
-            if let Some(ref p) = self.slot_b_payload {
-                return p;
-            }
-        }
-        &self.payload
+    pub fn has_both_methods(&self) -> bool {
+        self.chainload.is_some() && self.direct.is_some()
     }
 
-    pub fn mode_label(&self, slot: AndroidSlot) -> &'static str {
-        match self.active_payload(slot) {
+    pub fn active_method(&self, cfg: &BootConfig) -> BootMethod {
+        match (&self.chainload, &self.direct) {
+            (Some(_), Some(_)) => match self.kind {
+                OsKind::Android => cfg.android_method,
+                _ => cfg.linux_method,
+            },
+            (Some(_), None) => BootMethod::Chainload,
+            (None, Some(_)) => BootMethod::DirectStub,
+            (None, None) => BootMethod::Chainload,
+        }
+    }
+
+    pub fn active_variant(&self, cfg: &BootConfig) -> &MethodVariant {
+        match self.active_method(cfg) {
+            BootMethod::Chainload => self
+                .chainload
+                .as_ref()
+                .or(self.direct.as_ref())
+                .expect("BootEntry has at least one variant"),
+            BootMethod::DirectStub => self
+                .direct
+                .as_ref()
+                .or(self.chainload.as_ref())
+                .expect("BootEntry has at least one variant"),
+        }
+    }
+
+    pub fn active_payload(&self, cfg: &BootConfig) -> &BootPayload {
+        self.active_variant(cfg).payload_for_slot(cfg.android_slot)
+    }
+
+    pub fn active_supports_ab(&self, cfg: &BootConfig) -> bool {
+        self.active_variant(cfg).has_ab()
+    }
+
+    pub fn active_supports_el2(&self, cfg: &BootConfig) -> bool {
+        matches!(self.active_payload(cfg), BootPayload::Linux { .. })
+    }
+
+    pub fn mode_label(&self, cfg: &BootConfig) -> &'static str {
+        match self.active_payload(cfg) {
             BootPayload::Efi { .. } => "UEFI Chainload",
             BootPayload::Linux { .. } => "ARM64 Linux EFI Stub",
         }
+    }
+
+    pub fn chainload_label(&self) -> &str {
+        self.chainload
+            .as_ref()
+            .map(|v| v.label.as_str())
+            .unwrap_or("Chainload")
+    }
+
+    pub fn direct_label(&self) -> &str {
+        self.direct
+            .as_ref()
+            .map(|v| v.label.as_str())
+            .unwrap_or("Direct Stub")
     }
 }
 
@@ -206,6 +275,15 @@ fn classify_entry(filename: &str, title: &str, options: &str, payload: &BootPayl
     {
         return OsKind::Android;
     }
+    if joined.contains("linux")
+        || joined.contains("arch")
+        || joined.contains("fedora")
+        || joined.contains("ubuntu")
+        || joined.contains("debian")
+        || joined.contains("grub")
+    {
+        return OsKind::Linux;
+    }
     match payload {
         BootPayload::Linux { .. } => OsKind::Linux,
         BootPayload::Efi { .. } => OsKind::Generic,
@@ -229,9 +307,8 @@ fn detect_slot(filename: &str, options: &str) -> Option<AndroidSlot> {
     }
 }
 
-/// Produce a canonical pairing key for Android A/B entries so slot_a and slot_b merge into one card.
-fn ab_pair_key(filename: &str, entry: &BootEntry) -> Option<String> {
-    if entry.kind != OsKind::Android {
+fn ab_pair_key(filename: &str, kind: OsKind) -> Option<String> {
+    if kind != OsKind::Android {
         return None;
     }
     let fl = filename.to_ascii_lowercase();
@@ -257,6 +334,34 @@ fn find_el2_dtb(
     None
 }
 
+fn infer_method_label(title: &str, payload: &BootPayload) -> String {
+    match payload {
+        BootPayload::Efi { path, .. } => {
+            let low = path.to_ascii_lowercase();
+            if low.contains("gk3boot") {
+                String::from("gk3boot")
+            } else if low.contains("grub") {
+                String::from("GRUB")
+            } else if low.contains("systemd") {
+                String::from("systemd-boot")
+            } else if low.contains("bootmgfw") {
+                String::from("Windows BootMgr")
+            } else {
+                String::from("EFI Chainload")
+            }
+        }
+        BootPayload::Linux { .. } => {
+            let low = title.to_ascii_lowercase();
+            if low.contains("crdroid") {
+                String::from("Direct (crDroid)")
+            } else {
+                String::from("Direct Stub")
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ParsedRawEntry {
     entry: BootEntry,
     slot: Option<AndroidSlot>,
@@ -341,6 +446,16 @@ fn parse_bls_entry(
     let clean_title = title.replace(['\u{2014}', '\u{2013}'], "-");
     let kind = classify_entry(filename, &clean_title, &options, &payload);
     let slot = detect_slot(filename, &options);
+    let method_label = infer_method_label(&clean_title, &payload);
+
+    let variant = MethodVariant {
+        label: method_label,
+        version: version.clone(),
+        source_id: String::from(filename),
+        slot_a: payload,
+        slot_b: None,
+        drivers,
+    };
 
     let subtitle = if !version.is_empty() {
         format!("{} | {}", version, volume_label)
@@ -352,7 +467,6 @@ fn parse_bls_entry(
         id: String::from(filename),
         title: clean_title,
         subtitle,
-        version,
         sort_key: if sort_key.is_empty() {
             String::from("zzzz")
         } else {
@@ -361,14 +475,11 @@ fn parse_bls_entry(
         kind,
         volume_label: String::from(volume_label),
         fs_handle,
-        drivers,
-        payload,
-        slot_b_payload: None,
-        supports_ab_slot: false,
-        supports_el2: is_linux_stub,
+        chainload: if !is_linux_stub { Some(variant.clone()) } else { None },
+        direct: if is_linux_stub { Some(variant) } else { None },
     };
 
-    let pair_key = ab_pair_key(filename, &entry);
+    let pair_key = ab_pair_key(filename, kind);
     Some(ParsedRawEntry {
         entry,
         slot,
@@ -448,7 +559,6 @@ fn probe_el2_drivers_on_volume(
 }
 
 fn clean_paired_title(title: &str) -> String {
-    // Strip trailing "- slot _a" / "- slot _b" so merged A/B card has a clean title
     for suffix in [" - slot _a", " - slot _b", " (slot _a)", " (slot _b)"] {
         if let Some(stripped) = title.strip_suffix(suffix) {
             return String::from(stripped.trim());
@@ -457,7 +567,7 @@ fn clean_paired_title(title: &str) -> String {
     String::from(title)
 }
 
-/// Merge paired Android Slot A + Slot B entries into single clean cards with live A/B toggle.
+/// Step 1 of grouping: merge paired Android Slot A + Slot B entries into single MethodVariants.
 fn merge_ab_entries(raw: Vec<ParsedRawEntry>) -> Vec<BootEntry> {
     let mut merged: Vec<BootEntry> = Vec::new();
     let mut paired_indices: Vec<(String, usize)> = Vec::new();
@@ -466,16 +576,29 @@ fn merge_ab_entries(raw: Vec<ParsedRawEntry>) -> Vec<BootEntry> {
         if let (Some(ref key), Some(slot)) = (&item.pair_key, item.slot) {
             if let Some(&(_, idx)) = paired_indices.iter().find(|(k, _)| k == key) {
                 let target = &mut merged[idx];
-                match slot {
-                    AndroidSlot::B => {
-                        target.slot_b_payload = Some(item.entry.payload);
-                        target.supports_ab_slot = true;
+                // Attach Slot B payload onto the matching method variant (chainload or direct)
+                if let (Some(ref mut dst), Some(src)) = (&mut target.chainload, item.entry.chainload)
+                {
+                    match slot {
+                        AndroidSlot::B => dst.slot_b = Some(src.slot_a),
+                        AndroidSlot::A => {
+                            let prev = core::mem::replace(&mut dst.slot_a, src.slot_a);
+                            dst.slot_b = Some(prev);
+                            dst.source_id = src.source_id;
+                            target.id = item.entry.id;
+                        }
                     }
-                    AndroidSlot::A => {
-                        let prev = core::mem::replace(&mut target.payload, item.entry.payload);
-                        target.slot_b_payload = Some(prev);
-                        target.supports_ab_slot = true;
-                        target.id = item.entry.id;
+                } else if let (Some(ref mut dst), Some(src)) =
+                    (&mut target.direct, item.entry.direct)
+                {
+                    match slot {
+                        AndroidSlot::B => dst.slot_b = Some(src.slot_a),
+                        AndroidSlot::A => {
+                            let prev = core::mem::replace(&mut dst.slot_a, src.slot_a);
+                            dst.slot_b = Some(prev);
+                            dst.source_id = src.source_id;
+                            target.id = item.entry.id;
+                        }
                     }
                 }
                 target.title = clean_paired_title(&target.title);
@@ -484,10 +607,7 @@ fn merge_ab_entries(raw: Vec<ParsedRawEntry>) -> Vec<BootEntry> {
             } else {
                 let idx = merged.len();
                 let mut e = item.entry;
-                if slot == AndroidSlot::B {
-                    // Store temporarily until Slot A arrives (if it does)
-                    e.slot_b_payload = Some(e.payload.clone());
-                }
+                e.title = clean_paired_title(&e.title);
                 merged.push(e);
                 paired_indices.push((key.clone(), idx));
                 continue;
@@ -499,15 +619,60 @@ fn merge_ab_entries(raw: Vec<ParsedRawEntry>) -> Vec<BootEntry> {
     merged
 }
 
+/// Step 2 of grouping: merge Chainload + Direct EFI Stub entries of the same OS (Android / Linux)
+/// into ONE clean sidebar card so users switch Boot Method cleanly in the right-hand OS Settings pane.
+fn merge_os_methods(entries: Vec<BootEntry>) -> Vec<BootEntry> {
+    let mut out: Vec<BootEntry> = Vec::new();
+
+    for entry in entries {
+        let mergeable_kind = matches!(entry.kind, OsKind::Android | OsKind::Linux);
+        if mergeable_kind {
+            if let Some(existing) = out.iter_mut().find(|e| {
+                e.kind == entry.kind
+                    && e.fs_handle == entry.fs_handle
+                    && ((e.chainload.is_some() && e.direct.is_none() && entry.direct.is_some())
+                        || (e.direct.is_some() && e.chainload.is_none() && entry.chainload.is_some()))
+            }) {
+                // Combine the two complementary boot methods onto one unified OS card!
+                if existing.chainload.is_none() {
+                    existing.chainload = entry.chainload;
+                }
+                if existing.direct.is_none() {
+                    existing.direct = entry.direct;
+                }
+                // Prefer the more descriptive title (e.g. "crDroid 16.0 (gaokun3)" over generic "Android")
+                if existing.title.eq_ignore_ascii_case("android")
+                    && !entry.title.eq_ignore_ascii_case("android")
+                {
+                    existing.title = entry.title;
+                }
+                if existing.kind == OsKind::Android {
+                    existing.id = String::from("android");
+                    existing.sort_key = String::from("01android");
+                } else if existing.kind == OsKind::Linux {
+                    existing.sort_key = existing.sort_key.clone().min(entry.sort_key);
+                }
+                existing.subtitle = format!("Dual-Method | {}", existing.volume_label);
+                continue;
+            }
+        }
+        out.push(entry);
+    }
+
+    out
+}
+
 pub struct DiscoveryResult {
-    pub entries: Vec<BootEntry>,
+    pub grouped_entries: Vec<BootEntry>,
+    pub raw_entries: Vec<BootEntry>,
     pub esp_config_text: Option<String>,
     pub el2_drivers: El2Drivers,
 }
 
 /// Discover all bootable OS entries + EL2 helper drivers across attached UEFI filesystems.
+/// Returns both `grouped_entries` (clean 1-card-per-OS view) and `raw_entries` (every raw entry).
 pub fn discover_entries() -> DiscoveryResult {
-    let mut entries: Vec<BootEntry> = Vec::new();
+    let mut base_entries: Vec<BootEntry> = Vec::new();
     let mut raw_bls: Vec<ParsedRawEntry> = Vec::new();
     let mut esp_config_text: Option<String> = None;
     let mut el2_drivers = El2Drivers::default();
@@ -528,7 +693,8 @@ pub fn discover_entries() -> DiscoveryResult {
     let Ok(handles) = boot::locate_handle_buffer(SearchType::ByProtocol(&SimpleFileSystem::GUID))
     else {
         return DiscoveryResult {
-            entries,
+            grouped_entries: Vec::new(),
+            raw_entries: Vec::new(),
             esp_config_text,
             el2_drivers,
         };
@@ -594,23 +760,28 @@ pub fn discover_entries() -> DiscoveryResult {
                 )
             };
 
-            entries.push(BootEntry {
+            let variant = MethodVariant {
+                label: String::from("Windows BootMgr"),
+                version: String::from("EFI Boot Manager"),
+                source_id: id.clone(),
+                slot_a: BootPayload::Efi {
+                    path: String::from("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"),
+                    options: String::new(),
+                },
+                slot_b: None,
+                drivers: Vec::new(),
+            };
+
+            base_entries.push(BootEntry {
                 id,
                 title,
                 subtitle,
-                version: String::from("EFI Boot Manager"),
                 sort_key,
                 kind,
                 volume_label: vol_label.clone(),
                 fs_handle: handle,
-                drivers: Vec::new(),
-                payload: BootPayload::Efi {
-                    path: String::from("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"),
-                    options: String::new(),
-                },
-                slot_b_payload: None,
-                supports_ab_slot: false,
-                supports_el2: false,
+                chainload: Some(variant),
+                direct: None,
             });
         }
 
@@ -633,13 +804,62 @@ pub fn discover_entries() -> DiscoveryResult {
             &vol_label,
             &mut raw_bls,
         );
+
+        // 4. Optional Linux GRUB chainloaders (only if present on ESP)
+        for (distro, grub_path) in [
+            ("Arch Linux", "\\EFI\\arch\\grubaa64.efi"),
+            ("Fedora Linux", "\\EFI\\fedora\\grubaa64.efi"),
+            ("Ubuntu", "\\EFI\\ubuntu\\grubaa64.efi"),
+            ("Debian", "\\EFI\\debian\\grubaa64.efi"),
+            ("GRUB Linux", "\\EFI\\grub\\grubaa64.efi"),
+        ] {
+            if file_exists(&mut root, grub_path) {
+                let id = format!("grub-{}", distro.to_ascii_lowercase().replace(' ', "-"));
+                let variant = MethodVariant {
+                    label: String::from("GRUB"),
+                    version: String::from("GRUB2 ARM64"),
+                    source_id: String::from(grub_path),
+                    slot_a: BootPayload::Efi {
+                        path: String::from(grub_path),
+                        options: String::new(),
+                    },
+                    slot_b: None,
+                    drivers: Vec::new(),
+                };
+                raw_bls.push(ParsedRawEntry {
+                    entry: BootEntry {
+                        id,
+                        title: String::from(distro),
+                        subtitle: format!("GRUB2 Chainload | {}", vol_label),
+                        sort_key: String::from("02linux"),
+                        kind: OsKind::Linux,
+                        volume_label: vol_label.clone(),
+                        fs_handle: handle,
+                        chainload: Some(variant),
+                        direct: None,
+                    },
+                    slot: None,
+                    pair_key: None,
+                });
+            }
+        }
     }
 
-    entries.extend(merge_ab_entries(raw_bls));
-    entries.sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then_with(|| a.id.cmp(&b.id)));
+    // Build Raw list (every individual discovered entry)
+    let mut raw_entries = base_entries.clone();
+    for item in &raw_bls {
+        raw_entries.push(item.entry.clone());
+    }
+    raw_entries.sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then_with(|| a.id.cmp(&b.id)));
+
+    // Build Grouped list (merge A/B slots + merge Chainload/Direct Stub per OS!)
+    let mut grouped_entries = base_entries;
+    grouped_entries.extend(merge_os_methods(merge_ab_entries(raw_bls)));
+    grouped_entries.sort_by(|a, b| a.sort_key.cmp(&b.sort_key).then_with(|| a.id.cmp(&b.id)));
 
     DiscoveryResult {
-        entries,
+        grouped_entries,
+        raw_entries,
         esp_config_text,
         el2_drivers,
     }

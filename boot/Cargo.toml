@@ -1,6 +1,6 @@
 [package]
 name = "gaokun-boot"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "Custom graphical multi-OS UEFI boot manager for Huawei MateBook E Go (SC8280XP / gaokun3)"
